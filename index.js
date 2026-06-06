@@ -120,8 +120,8 @@ async function scan() {
   try {
     console.log(`[${new Date().toLocaleTimeString()}] Scanning...`);
 
-    // Birdeye token list sorted by 6h price change descending
-    const url = `https://public-api.birdeye.so/defi/tokenlist?sort_by=v6hChangePercent&sort_type=desc&offset=0&limit=100&min_liquidity=5000&chain=solana`;
+    // Birdeye token list sorted by 24h price change descending
+    const url = `https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hChangePercent&sort_type=desc&offset=0&limit=100&min_liquidity=5000&chain=solana`;
     const res = await get(url, {
       "X-API-KEY": BIRDEYE_KEY,
       "x-chain": "solana",
@@ -134,7 +134,7 @@ async function scan() {
 
     for (const token of tokens) {
       const mcapRaw   = parseFloat(token.mc || 0);
-      const change6h  = parseFloat(token.v6hChangePercent || 0);
+      const change6h  = parseFloat(token.v24hChangePercent || 0);
       const addr      = token.address || "";
       const name      = token.name || "Unknown";
       const symbol    = token.symbol || "?";
