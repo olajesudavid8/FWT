@@ -128,6 +128,7 @@ async function scan() {
     });
 
     const tokens = res?.data?.tokens || [];
+    console.log(`[DEBUG] Birdeye raw: ${JSON.stringify(res).slice(0, 300)}`);
     console.log(`[DEBUG] Birdeye returned ${tokens.length} tokens`);
 
     let matchCount = 0;
