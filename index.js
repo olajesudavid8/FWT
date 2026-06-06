@@ -143,10 +143,12 @@ async function scan() {
       const liq       = parseFloat(token.liquidity || 0);
       const vol24h    = parseFloat(token.v24hUSD || 0);
 
+      console.log(`[MC] ${symbol}: $${mcapRaw.toLocaleString()}`);
       // MC filter
       if (mcapRaw < MIN_MC_CURRENT || mcapRaw > MAX_MC_CURRENT) continue;
 
       // 6h pump filter
+      console.log(`[TOKEN] ${symbol} MC: $${mcapRaw.toLocaleString()} | 24h: ${change6h}%`);
       if (change6h < MIN_PUMP_CURRENT) continue;
 
       // Get pair data from DexScreener for age check
