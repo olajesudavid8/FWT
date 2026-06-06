@@ -8,7 +8,7 @@ const BIRDEYE_KEY    = "2a4b52a15d9e4847a2e1532f1c1597f7";
 const MIN_MC         = 50000;
 const MAX_MC         = 1000000;
 const MIN_AGE_DAYS   = 10;
-const MIN_PUMP_24H    = 25;
+const MIN_PUMP_6H    = 25;
 const INTERVAL_MS    = 60_000;
 // ────────────────────────────────────────────────────────
 
