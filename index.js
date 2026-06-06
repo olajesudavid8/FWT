@@ -121,14 +121,14 @@ async function scan() {
     console.log(`[${new Date().toLocaleTimeString()}] Scanning...`);
 
     // Birdeye token list sorted by volume (supported on free tier)
-    const url = `https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=50&min_liquidity=5000&chain=solana`;
+    const url = `https://public-api.birdeye.so/defi/tokenlist?sort_by=mc&sort_type=asc&offset=0&limit=50&min_liquidity=5000&chain=solana`;
     const res = await get(url, {
       "X-API-KEY": BIRDEYE_KEY,
       "x-chain": "solana",
     });
 
     const tokens = res?.data?.tokens || [];
-    console.log(`[DEBUG] Birdeye raw: ${JSON.stringify(res).slice(0, 300)}`);
+    console.log(`[DEBUG] Birdeye returned ${tokens.length} tokens`);
     console.log(`[DEBUG] Birdeye returned ${tokens.length} tokens`);
 
     let matchCount = 0;
