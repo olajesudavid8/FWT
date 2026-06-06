@@ -161,6 +161,7 @@ async function scan() {
       const mcapRaw  = parseFloat(pair.marketCap || 0);
       const change6h = parseFloat(pair.priceChange?.h6 || 0);
       const ageDays  = (Date.now() - (pair.pairCreatedAt || 0)) / (1000 * 60 * 60 * 24);
+      console.log(`[TOKEN] ${pair.baseToken?.symbol} MC: $${mcapRaw.toLocaleString()} | 6h: ${change6h}% | Age: ${Math.floor(ageDays)}d`);
 
       // Apply filters
       if (mcapRaw < MIN_MC_CURRENT || mcapRaw > MAX_MC_CURRENT) continue;
