@@ -120,8 +120,8 @@ async function scan() {
   try {
     console.log(`[${new Date().toLocaleTimeString()}] Scanning...`);
 
-    // Birdeye token list sorted by 24h price change descending
-    const url = `https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hChangePercent&sort_type=desc&offset=0&limit=100&min_liquidity=5000&chain=solana`;
+    // Birdeye token list sorted by volume (supported on free tier)
+    const url = `https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=100&min_liquidity=5000&chain=solana`;
     const res = await get(url, {
       "X-API-KEY": BIRDEYE_KEY,
       "x-chain": "solana",
