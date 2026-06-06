@@ -4,7 +4,6 @@ const http  = require("http");
 // ── CONFIG ──────────────────────────────────────────────
 const BOT_TOKEN      = "8769953136:AAHFrooUVd1yx8BxPbJVTJPhthyhW-ptTqY";
 const CHAT_ID        = "5092755750";
-const BIRDEYE_KEY    = "2a4b52a15d9e4847a2e1532f1c1597f7";
 const MIN_MC         = 50000;
 const MAX_MC         = 1000000;
 const MIN_AGE_DAYS   = 10;
@@ -120,59 +119,52 @@ async function scan() {
   try {
     console.log(`[${new Date().toLocaleTimeString()}] Scanning...`);
 
-    // Birdeye token list sorted by volume (supported on free tier)
-    const url = `https://public-api.birdeye.so/defi/tokenlist?sort_by=mc&sort_type=asc&offset=0&limit=50&min_liquidity=5000&chain=solana`;
-    const res = await get(url, {
-      "X-API-KEY": BIRDEYE_KEY,
-      "x-chain": "solana",
-    });
+    // Fetch top boosted tokens from DexScreener (no API key needed)
+    const [top, latest] = await Promise.all([
+      get("https://api.dexscreener.com/token-boosts/top/v1"),
+      get("https://api.dexscreener.com/token-boosts/latest/v1"),
+    ]);
 
-    const tokens = res?.data?.tokens || [];
-    console.log(`[DEBUG] Birdeye returned ${tokens.length} tokens`);
-    console.log(`[DEBUG] Birdeye returned ${tokens.length} tokens`);
+    const boosted = [];
+    if (Array.isArray(top)) boosted.push(...top);
+    if (Array.isArray(latest)) boosted.push(...latest);
+
+    // Dedupe by token address
+    const seen = new Map();
+    for (const t of boosted) {
+      if (t.tokenAddress) seen.set(t.tokenAddress, t);
+    }
+
+    // Filter Solana only
+    const solTokens = Array.from(seen.values()).filter(
+      t => (t.chainId || "").toLowerCase() === "solana"
+    );
+
+    console.log(`[DEBUG] ${solTokens.length} Solana boosted tokens found`);
 
     let matchCount = 0;
 
-    for (const token of tokens) {
-      const mcapRaw   = parseFloat(token.mc || 0);
-      const change6h  = parseFloat(token.v24hChangePercent || 0);
-      const addr      = token.address || "";
-      const name      = token.name || "Unknown";
-      const symbol    = token.symbol || "?";
-      const priceUsd  = parseFloat(token.price || 0);
-      const liq       = parseFloat(token.liquidity || 0);
-      const vol24h    = parseFloat(token.v24hUSD || 0);
+    for (const token of solTokens) {
+      const addr = token.tokenAddress;
+      if (!addr) continue;
 
-      console.log(`[MC] ${symbol}: $${mcapRaw.toLocaleString()}`);
-      // MC filter
-      if (mcapRaw < MIN_MC_CURRENT || mcapRaw > MAX_MC_CURRENT) continue;
-
-      // 6h pump filter
-      console.log(`[TOKEN] ${symbol} MC: $${mcapRaw.toLocaleString()} | 24h: ${change6h}%`);
-      if (change6h < MIN_PUMP_CURRENT) continue;
-
-      // Get pair data from DexScreener for age check
-      let ageDays = 0;
-      let pairAddr = "";
-      let change1h = "N/A";
-      let change24h = "N/A";
-      let dexUrl = `https://dexscreener.com/solana/${addr}`;
-
+      // Look up pair data on DexScreener
+      let pair = null;
       try {
-        const dex = await get(`https://api.dexscreener.com/latest/dex/tokens/${addr}`);
-        const pairs = dex?.pairs?.filter(p => (p.chainId || "").toLowerCase() === "solana") || [];
-        if (pairs.length > 0) {
-          pairs.sort((a, b) => parseFloat(b.liquidity?.usd || 0) - parseFloat(a.liquidity?.usd || 0));
-          const pair = pairs[0];
-          ageDays = (Date.now() - (pair.pairCreatedAt || 0)) / (1000 * 60 * 60 * 24);
-          pairAddr = pair.pairAddress || "";
-          change1h = pair.priceChange?.h1 != null ? `${pair.priceChange.h1 > 0 ? "+" : ""}${parseFloat(pair.priceChange.h1).toFixed(1)}%` : "N/A";
-          change24h = pair.priceChange?.h24 != null ? `${pair.priceChange.h24 > 0 ? "+" : ""}${parseFloat(pair.priceChange.h24).toFixed(1)}%` : "N/A";
-          if (pairAddr) dexUrl = `https://dexscreener.com/solana/${pairAddr}`;
-        }
-      } catch (e) {}
+        const res = await get(`https://api.dexscreener.com/latest/dex/tokens/${addr}`);
+        const pairs = (res?.pairs || []).filter(p => (p.chainId || "").toLowerCase() === "solana");
+        if (pairs.length === 0) continue;
+        pairs.sort((a, b) => parseFloat(b.liquidity?.usd || 0) - parseFloat(a.liquidity?.usd || 0));
+        pair = pairs[0];
+      } catch (e) { continue; }
 
-      // Age filter
+      const mcapRaw  = parseFloat(pair.marketCap || 0);
+      const change6h = parseFloat(pair.priceChange?.h6 || 0);
+      const ageDays  = (Date.now() - (pair.pairCreatedAt || 0)) / (1000 * 60 * 60 * 24);
+
+      // Apply filters
+      if (mcapRaw < MIN_MC_CURRENT || mcapRaw > MAX_MC_CURRENT) continue;
+      if (change6h < MIN_PUMP_CURRENT) continue;
       if (ageDays < MIN_AGE_CURRENT) continue;
 
       // Cooldown — 4 hours
@@ -182,10 +174,15 @@ async function scan() {
 
       matchCount++;
 
-      const mcap   = `$${Number(mcapRaw).toLocaleString()}`;
-      const liqStr = `$${Number(liq).toLocaleString()}`;
-      const volStr = `$${Number(vol24h).toLocaleString()}`;
-      const ageStr = `${Math.floor(ageDays)}d`;
+      const name      = pair.baseToken?.name || "Unknown";
+      const symbol    = pair.baseToken?.symbol || "?";
+      const priceUsd  = parseFloat(pair.priceUsd || 0);
+      const mcap      = `$${Number(mcapRaw).toLocaleString()}`;
+      const liq       = `$${Number(pair.liquidity?.usd || 0).toLocaleString()}`;
+      const change1h  = pair.priceChange?.h1 != null ? `${pair.priceChange.h1 > 0 ? "+" : ""}${parseFloat(pair.priceChange.h1).toFixed(1)}%` : "N/A";
+      const change24h = pair.priceChange?.h24 != null ? `${pair.priceChange.h24 > 0 ? "+" : ""}${parseFloat(pair.priceChange.h24).toFixed(1)}%` : "N/A";
+      const ageStr    = `${Math.floor(ageDays)}d`;
+      const dexUrl    = `https://dexscreener.com/solana/${pair.pairAddress}`;
 
       const msg =
 `📈 <b>GRADUAL MOVER — SOLANA</b>
@@ -193,8 +190,7 @@ async function scan() {
 🪙 <b>${name}</b> (<b>$${symbol}</b>)
 💰 Market Cap: <b>${mcap}</b>
 💵 Price: <b>$${priceUsd.toFixed(8)}</b>
-💧 Liquidity: <b>${liqStr}</b>
-📊 24h Volume: <b>${volStr}</b>
+💧 Liquidity: <b>${liq}</b>
 🕐 Token Age: <b>${ageStr}</b>
 
 📈 6h Change: <b>+${change6h.toFixed(1)}%</b>
@@ -225,13 +221,13 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => console.log(`Ping server on port ${process.env.PORT || 3000}`));
 
 (async () => {
-  console.log("📈 Gradual Mover Detector started (Birdeye)");
+  console.log("📈 Gradual Mover Detector started");
   console.log(`   MC range   : $${MIN_MC_CURRENT.toLocaleString()} – $${MAX_MC_CURRENT.toLocaleString()}`);
   console.log(`   Min age    : ${MIN_AGE_CURRENT} days`);
   console.log(`   Min 6h pump: ${MIN_PUMP_CURRENT}%`);
   console.log(`   Interval   : ${INTERVAL_MS / 1000}s\n`);
   await sendTelegram(
-    `✅ <b>Gradual Mover Detector is live! (Birdeye)</b>\n\n` +
+    `✅ <b>Gradual Mover Detector is live!</b>\n\n` +
     `Watching Solana for older tokens grinding up steadily.\n\n` +
     `Filters:\n• MC range: $50k – $1M\n• Min age: 10 days\n• Min 6h pump: 25%\n• Chain: Solana only\n\n` +
     `Commands: /setmc /setpump /setage /settings /help`
