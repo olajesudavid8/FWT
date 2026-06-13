@@ -113,6 +113,8 @@ async function initLastSeen() {
     console.error("[INIT ERROR]", e.message);
   }
 }
+
+async function checkWallet(walletAddr, walletName) {
   try {
     const txs = await get(
       `https://api.helius.xyz/v0/addresses/${walletAddr}/transactions?api-key=${HELIUS_KEY}&limit=10`
