@@ -16,6 +16,7 @@ const CHAINS = ["solana", "ethereum", "bsc"];
 
 const lastSeen = {};
 let lastUpdateId = 0;
+const alerted = new Map(); // cooldown tracker
 
 function get(url, headers = {}) {
   return new Promise((resolve, reject) => {
@@ -126,6 +127,11 @@ async function checkWallet(walletAddr, walletName) {
         const isReceived = transfer?.toUserAccount === walletAddr;
         const isBuy = type === "SWAP" && transfer?.toUserAccount === walletAddr;
         if (!isReceived && !isBuy) continue;
+
+        // 1 hour cooldown per token
+        const lastAlert = alerted.get(mint) || 0;
+        if (Date.now() - lastAlert < 3600_000) continue;
+        alerted.set(mint, Date.now());
 
         const pair = await getTokenData(mint);
         if (!pair) continue;
