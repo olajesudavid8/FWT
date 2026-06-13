@@ -11,7 +11,7 @@ const WALLETS = {
   "5fkAwNVpT8A1UHEnY62VEFpqgagdoP8FYrv5ideiQp5c": "Logjam",
 };
 
-const CHAINS = ["solana", "ethereum", "bsc"];
+const CHAINS = ["solana"];
 // ────────────────────────────────────────────────────────
 
 const lastSeen = {};
@@ -100,7 +100,19 @@ async function getTokenData(mint) {
   }
 }
 
-async function checkWallet(walletAddr, walletName) {
+async function initLastSeen() {
+  try {
+    const txs = await get(
+      `https://api.helius.xyz/v0/addresses/5fkAwNVpT8A1UHEnY62VEFpqgagdoP8FYrv5ideiQp5c/transactions?api-key=${HELIUS_KEY}&limit=1`
+    );
+    if (Array.isArray(txs) && txs.length > 0) {
+      lastSeen["5fkAwNVpT8A1UHEnY62VEFpqgagdoP8FYrv5ideiQp5c"] = txs[0].signature;
+      console.log(`[INIT] Last seen tx set — only new transactions will alert`);
+    }
+  } catch (e) {
+    console.error("[INIT ERROR]", e.message);
+  }
+}
   try {
     const txs = await get(
       `https://api.helius.xyz/v0/addresses/${walletAddr}/transactions?api-key=${HELIUS_KEY}&limit=10`
@@ -199,11 +211,12 @@ http.createServer((req, res) => {
   await sendTelegram(
     `✅ <b>Logjam Wallet Tracker is live!</b>\n\n` +
     `👤 Monitoring: <b>Logjam</b>\n` +
-    `🔗 Chains: Solana, Ethereum, BSC\n` +
+    `🔗 Chains: Solana only\n` +
     `💰 MC filter: None — all tokens alerted\n` +
     `⏱ Scan: every 30 seconds\n\n` +
     `The moment Logjam touches anything, you'll know. 👀`
   );
+  await initLastSeen();
   await scan();
   setInterval(scan, INTERVAL_MS);
   setInterval(pollCommands, 3000);
