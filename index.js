@@ -8,8 +8,8 @@ const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const TELEGRAM_TOKEN = "8769953136:AAHFrooUVd1yx8BxPbJVTJPhthyhW-ptTqY";
 const CHAT_ID = "5092755750";
 
-const MIN_TOKEN_AGE_DAYS = 30;
-const MIN_GAP_HOURS = 48;
+const MIN_TOKEN_AGE_DAYS = 29;
+const MIN_GAP_HOURS = 47;
 const MIN_MC = 1000;
 const MAX_MC = 10000;
 const SCAN_INTERVAL_MS = 2 * 60 * 1000;
@@ -18,7 +18,6 @@ const SCAN_INTERVAL_MS = 2 * 60 * 1000;
 function log(tag, msg) {
   console.log(`[${new Date().toISOString()}] [${tag}] ${msg}`);
 }
-
 function logError(tag, msg, err) {
   console.error(`[${new Date().toISOString()}] [${tag}] ${msg}`, err?.message || err || "");
 }
@@ -83,13 +82,16 @@ function sendAlert(token) {
   log("ALERT", `${token.symbol} | MC $${Math.round(token.mc)} | Gap ${token.gapHours}h | Age ${token.ageDays}d`);
 }
 
-// ── DexScreener: fetch low MC solana pairs ────────────────────────────────────
-async function fetchCandidates() {
-  const results = new Map();
+// ── DexScreener: get token addresses from latest profiles ─────────────────────
+// This is the only free endpoint that returns a broad list of solana tokens
+async function fetchTokenAddresses() {
+  const addresses = new Map(); // address → symbol
 
   const endpoints = [
-    "https://api.dexscreener.com/latest/dex/pairs/solana",
+    "https://api.dexscreener.com/token-profiles/latest/v1",
+    "https://api.dexscreener.com/token-profiles/recent-updates/v1",
     "https://api.dexscreener.com/token-boosts/latest/v1",
+    "https://api.dexscreener.com/token-boosts/top/v1",
   ];
 
   for (const url of endpoints) {
@@ -101,61 +103,36 @@ async function fetchCandidates() {
         continue;
       }
       const json = await res.json();
-      const pairs = json?.pairs || json?.data?.pairs || [];
-      const tokens = json?.tokens || [];
+      const items = Array.isArray(json) ? json : (json?.data || []);
+      log("FETCH", `${url} → ${items.length} items`);
 
-      log("FETCH", `${url} → ${pairs.length} pairs, ${tokens.length} tokens`);
-
-      for (const p of pairs) {
-        if (p.chainId !== "solana") continue;
-        const mc = p.marketCap || p.fdv || 0;
-        if (mc < MIN_MC || mc > MAX_MC) continue;
-        const address = p.baseToken?.address;
-        if (!address || results.has(address)) continue;
-        results.set(address, {
-          address,
-          symbol: p.baseToken?.symbol || "?",
-          mc,
-          pairCreatedAt: p.pairCreatedAt || null,
-        });
-      }
-
-      for (const t of tokens) {
-        if (t.chainId !== "solana") continue;
-        const address = t.tokenAddress;
-        if (!address || results.has(address)) continue;
-        results.set(address, {
-          address,
-          symbol: t.description || "?",
-          mc: 0,
-          pairCreatedAt: null,
-        });
+      for (const item of items) {
+        if (item.chainId !== "solana") continue;
+        const address = item.tokenAddress;
+        if (!address || addresses.has(address)) continue;
+        addresses.set(address, item.description || item.symbol || "?");
       }
     } catch (e) {
       logError("FETCH", `Exception fetching ${url}:`, e);
     }
   }
 
-  log("FETCH", `Total unique candidates after MC filter: ${results.size}`);
-  return [...results.values()];
+  log("FETCH", `Total unique solana token addresses: ${addresses.size}`);
+  return addresses;
 }
 
-// ── DexScreener: get pair detail for a specific token ─────────────────────────
-async function getPairDetail(address) {
+// ── DexScreener: get pair details for a token ─────────────────────────────────
+async function getTokenPairs(address) {
   try {
-    const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
-    if (!res.ok) {
-      logError("DETAIL", `Bad response for ${address}: ${res.status}`);
-      return null;
-    }
+    const res = await fetch(`https://api.dexscreener.com/token-pairs/v1/solana/${address}`);
+    if (!res.ok) return null;
     const json = await res.json();
-    const pairs = json?.pairs || [];
-    const solanaPairs = pairs.filter((p) => p.chainId === "solana");
-    if (!solanaPairs.length) return null;
-    solanaPairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
-    return solanaPairs[0];
+    const pairs = Array.isArray(json) ? json : (json?.pairs || []);
+    if (!pairs.length) return null;
+    // Pick pair with highest liquidity
+    pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+    return pairs[0];
   } catch (e) {
-    logError("DETAIL", `Exception for ${address}:`, e);
     return null;
   }
 }
@@ -195,64 +172,60 @@ async function getLastTradeSec(mintAddress) {
 async function scan() {
   log("SCAN", "Starting scan...");
 
-  let candidates;
+  let tokenAddresses;
   try {
-    candidates = await fetchCandidates();
+    tokenAddresses = await fetchTokenAddresses();
   } catch (e) {
-    logError("SCAN", "fetchCandidates threw:", e);
-    await sendTelegram(`⚠️ *Scan error*: fetchCandidates failed — ${e.message}`);
+    logError("SCAN", "fetchTokenAddresses threw:", e);
+    await sendTelegram(`⚠️ *Scan error*: fetchTokenAddresses failed — ${e.message}`);
     return;
   }
 
-  log("SCAN", `${candidates.length} candidates to check`);
+  log("SCAN", `${tokenAddresses.size} solana tokens to evaluate`);
 
   const nowSec = Math.floor(Date.now() / 1000);
   let skippedAlerted = 0, skippedAge = 0, skippedMC = 0, skippedDormancy = 0, passed = 0;
 
-  for (const token of candidates) {
-    const { address } = token;
-
+  for (const [address, symbol] of tokenAddresses) {
     if (alerted.has(address)) { skippedAlerted++; continue; }
 
-    // Age check
-    let ageDays = null;
-    if (token.pairCreatedAt) {
-      ageDays = Math.floor((Date.now() - token.pairCreatedAt) / 86_400_000);
-      if (ageDays < MIN_TOKEN_AGE_DAYS) { skippedAge++; continue; }
-    }
+    // Get pair details for MC + age
+    const pair = await getTokenPairs(address);
+    if (!pair) { skippedMC++; continue; }
 
     // MC check
-    let mc = token.mc;
-    if (!mc || mc < MIN_MC || mc > MAX_MC) {
-      const detail = await getPairDetail(address);
-      if (!detail) { skippedMC++; continue; }
-      mc = detail.marketCap || detail.fdv || 0;
-      if (mc < MIN_MC || mc > MAX_MC) { skippedMC++; continue; }
-      if (!ageDays && detail.pairCreatedAt) {
-        ageDays = Math.floor((Date.now() - detail.pairCreatedAt) / 86_400_000);
-        if (ageDays < MIN_TOKEN_AGE_DAYS) { skippedAge++; continue; }
-      }
-    }
+    const mc = pair.marketCap || pair.fdv || 0;
+    if (mc < MIN_MC || mc > MAX_MC) { skippedMC++; continue; }
 
-    if (!ageDays || ageDays < MIN_TOKEN_AGE_DAYS) { skippedAge++; continue; }
+    // Age check
+    const pairCreatedAt = pair.pairCreatedAt; // ms
+    if (!pairCreatedAt) { skippedAge++; continue; }
+    const ageDays = Math.floor((Date.now() - pairCreatedAt) / 86_400_000);
+    if (ageDays < MIN_TOKEN_AGE_DAYS) { skippedAge++; continue; }
 
-    // Dormancy check
+    // Dormancy check via Helius
     const lastTrade = await getLastTradeSec(address);
     if (!lastTrade) { skippedDormancy++; continue; }
 
     const gapHours = Math.floor((nowSec - lastTrade) / 3600);
     if (gapHours < MIN_GAP_HOURS) { skippedDormancy++; continue; }
 
-    // Passed
+    // Passed all filters
     passed++;
     alerted.add(address);
     saveAlerted(alerted);
-    sendAlert({ address, symbol: token.symbol, ageDays, gapHours, mc });
+    sendAlert({
+      address,
+      symbol: pair.baseToken?.symbol || symbol,
+      ageDays,
+      gapHours,
+      mc,
+    });
 
     await new Promise((r) => setTimeout(r, 500));
   }
 
-  log("SCAN", `Done — passed: ${passed} | skipped: alerted=${skippedAlerted} age=${skippedAge} mc=${skippedMC} dormancy=${skippedDormancy}`);
+  log("SCAN", `Done — passed: ${passed} | skipped: alerted=${skippedAlerted} mc=${skippedMC} age=${skippedAge} dormancy=${skippedDormancy}`);
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
@@ -260,7 +233,6 @@ log("BOOT", "SOL Dormant Token Scanner starting");
 log("BOOT", `MC range: $${MIN_MC} – $${MAX_MC}`);
 log("BOOT", `Min age: ${MIN_TOKEN_AGE_DAYS} days | Min gap: ${MIN_GAP_HOURS}h | Interval: ${SCAN_INTERVAL_MS / 1000}s`);
 
-// Telegram boot message
 sendTelegram(
   `✅ *Scanner Online*\n\n` +
   `MC range: $${MIN_MC.toLocaleString()} – $${MAX_MC.toLocaleString()}\n` +
@@ -270,7 +242,6 @@ sendTelegram(
   `Previously seen: ${alerted.size} tokens`
 );
 
-// Catch unhandled errors so Railway doesn't silently die
 process.on("uncaughtException", (e) => {
   logError("CRASH", "Uncaught exception:", e);
   sendTelegram(`🔴 *Scanner crashed*: ${e.message}`).finally(() => process.exit(1));
