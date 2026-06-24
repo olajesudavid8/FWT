@@ -1,18 +1,25 @@
 const { Telegraf } = require("telegraf");
 const fs = require("fs");
 const path = require("path");
+const http = require("http");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const HELIUS_API_KEY = "947b9439-fd89-44a2-a5c6-844487a27892";
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const TELEGRAM_TOKEN = "8769953136:AAHFrooUVd1yx8BxPbJVTJPhthyhW-ptTqY";
 const CHAT_ID = "5092755750";
+const PORT = process.env.PORT || 3000;
 
 const MIN_TOKEN_AGE_DAYS = 29;
 const MIN_GAP_HOURS = 47;
 const MIN_MC = 1000;
 const MAX_MC = 10000;
 const SCAN_INTERVAL_MS = 2 * 60 * 1000;
+
+// ── Keep-alive HTTP server (required by Railway) ──────────────────────────────
+http.createServer((req, res) => res.end("OK")).listen(PORT, () => {
+  log("BOOT", `Health check server listening on port ${PORT}`);
+});
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function log(tag, msg) {
@@ -82,59 +89,69 @@ function sendAlert(token) {
   log("ALERT", `${token.symbol} | MC $${Math.round(token.mc)} | Gap ${token.gapHours}h | Age ${token.ageDays}d`);
 }
 
-// ── DexScreener: get token addresses from latest profiles ─────────────────────
-// This is the only free endpoint that returns a broad list of solana tokens
-async function fetchTokenAddresses() {
-  const addresses = new Map(); // address → symbol
+// ── Raydium: fetch pools page by page, filter by low MC ──────────────────────
+async function fetchCandidates() {
+  const results = new Map();
+  let page = 1;
+  const pageSize = 100;
+  let totalFetched = 0;
 
-  const endpoints = [
-    "https://api.dexscreener.com/token-profiles/latest/v1",
-    "https://api.dexscreener.com/token-profiles/recent-updates/v1",
-    "https://api.dexscreener.com/token-boosts/latest/v1",
-    "https://api.dexscreener.com/token-boosts/top/v1",
-  ];
-
-  for (const url of endpoints) {
+  // Raydium sorts by liquidity asc — so low liquidity (our targets) come first
+  // We stop once MC starts going above our range consistently
+  while (true) {
     try {
-      log("FETCH", `Calling ${url}`);
+      const url = `https://api-v3.raydium.io/pools/info/list?poolType=all&poolSortField=liquidity&sortType=asc&pageSize=${pageSize}&page=${page}`;
+      log("FETCH", `Raydium page ${page} → ${url}`);
+
       const res = await fetch(url);
       if (!res.ok) {
-        logError("FETCH", `Bad response from ${url}: ${res.status} ${res.statusText}`);
-        continue;
+        logError("FETCH", `Raydium bad response: ${res.status}`);
+        break;
       }
-      const json = await res.json();
-      const items = Array.isArray(json) ? json : (json?.data || []);
-      log("FETCH", `${url} → ${items.length} items`);
 
-      for (const item of items) {
-        if (item.chainId !== "solana") continue;
-        const address = item.tokenAddress;
-        if (!address || addresses.has(address)) continue;
-        addresses.set(address, item.description || item.symbol || "?");
+      const json = await res.json();
+      const pools = json?.data?.data || [];
+      if (!pools.length) {
+        log("FETCH", `Raydium page ${page} empty — stopping`);
+        break;
       }
+
+      totalFetched += pools.length;
+      let inRangeCount = 0;
+
+      for (const pool of pools) {
+        const mc = pool.marketCap || pool.tvl || 0;
+        if (mc > MAX_MC * 5) {
+          // We've gone well past our range, stop paginating
+          log("FETCH", `MC ceiling reached at page ${page}, stopping`);
+          return [...results.values()];
+        }
+        if (mc < MIN_MC || mc > MAX_MC) continue;
+
+        const address = pool.mintA?.address;
+        const symbol = pool.mintA?.symbol;
+        const pairCreatedAt = pool.openTime ? pool.openTime * 1000 : null; // openTime is unix sec
+
+        if (!address || results.has(address)) continue;
+        inRangeCount++;
+        results.set(address, { address, symbol, mc, pairCreatedAt });
+      }
+
+      log("FETCH", `Page ${page}: ${pools.length} pools, ${inRangeCount} in MC range`);
+
+      // Stop after 10 pages to avoid rate limits
+      if (page >= 10) break;
+      page++;
+
+      await new Promise((r) => setTimeout(r, 300)); // be gentle with Raydium
     } catch (e) {
-      logError("FETCH", `Exception fetching ${url}:`, e);
+      logError("FETCH", `Exception on page ${page}:`, e);
+      break;
     }
   }
 
-  log("FETCH", `Total unique solana token addresses: ${addresses.size}`);
-  return addresses;
-}
-
-// ── DexScreener: get pair details for a token ─────────────────────────────────
-async function getTokenPairs(address) {
-  try {
-    const res = await fetch(`https://api.dexscreener.com/token-pairs/v1/solana/${address}`);
-    if (!res.ok) return null;
-    const json = await res.json();
-    const pairs = Array.isArray(json) ? json : (json?.pairs || []);
-    if (!pairs.length) return null;
-    // Pick pair with highest liquidity
-    pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
-    return pairs[0];
-  } catch (e) {
-    return null;
-  }
+  log("FETCH", `Total fetched: ${totalFetched} pools, ${results.size} in MC range`);
+  return [...results.values()];
 }
 
 // ── Helius: get last transaction timestamp ────────────────────────────────────
@@ -172,35 +189,27 @@ async function getLastTradeSec(mintAddress) {
 async function scan() {
   log("SCAN", "Starting scan...");
 
-  let tokenAddresses;
+  let candidates;
   try {
-    tokenAddresses = await fetchTokenAddresses();
+    candidates = await fetchCandidates();
   } catch (e) {
-    logError("SCAN", "fetchTokenAddresses threw:", e);
-    await sendTelegram(`⚠️ *Scan error*: fetchTokenAddresses failed — ${e.message}`);
+    logError("SCAN", "fetchCandidates threw:", e);
+    await sendTelegram(`⚠️ *Scan error*: fetchCandidates failed — ${e.message}`);
     return;
   }
 
-  log("SCAN", `${tokenAddresses.size} solana tokens to evaluate`);
+  log("SCAN", `${candidates.length} candidates to evaluate`);
 
   const nowSec = Math.floor(Date.now() / 1000);
-  let skippedAlerted = 0, skippedAge = 0, skippedMC = 0, skippedDormancy = 0, passed = 0;
+  let skippedAlerted = 0, skippedAge = 0, skippedDormancy = 0, passed = 0;
 
-  for (const [address, symbol] of tokenAddresses) {
+  for (const token of candidates) {
+    const { address } = token;
     if (alerted.has(address)) { skippedAlerted++; continue; }
 
-    // Get pair details for MC + age
-    const pair = await getTokenPairs(address);
-    if (!pair) { skippedMC++; continue; }
-
-    // MC check
-    const mc = pair.marketCap || pair.fdv || 0;
-    if (mc < MIN_MC || mc > MAX_MC) { skippedMC++; continue; }
-
     // Age check
-    const pairCreatedAt = pair.pairCreatedAt; // ms
-    if (!pairCreatedAt) { skippedAge++; continue; }
-    const ageDays = Math.floor((Date.now() - pairCreatedAt) / 86_400_000);
+    if (!token.pairCreatedAt) { skippedAge++; continue; }
+    const ageDays = Math.floor((Date.now() - token.pairCreatedAt) / 86_400_000);
     if (ageDays < MIN_TOKEN_AGE_DAYS) { skippedAge++; continue; }
 
     // Dormancy check via Helius
@@ -214,18 +223,12 @@ async function scan() {
     passed++;
     alerted.add(address);
     saveAlerted(alerted);
-    sendAlert({
-      address,
-      symbol: pair.baseToken?.symbol || symbol,
-      ageDays,
-      gapHours,
-      mc,
-    });
+    sendAlert({ address, symbol: token.symbol, ageDays, gapHours, mc: token.mc });
 
     await new Promise((r) => setTimeout(r, 500));
   }
 
-  log("SCAN", `Done — passed: ${passed} | skipped: alerted=${skippedAlerted} mc=${skippedMC} age=${skippedAge} dormancy=${skippedDormancy}`);
+  log("SCAN", `Done — passed: ${passed} | skipped: alerted=${skippedAlerted} age=${skippedAge} dormancy=${skippedDormancy}`);
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
