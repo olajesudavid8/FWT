@@ -1,11 +1,12 @@
 {
-  "name": "pump-alert-bot",
+  "name": "sol-dormant-scanner",
   "version": "1.0.0",
+  "description": "Solana dormant token wake-up alert bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
-  "engines": {
-    "node": ">=18.0.0"
+  "dependencies": {
+    "telegraf": "^4.16.3"
   }
 }
