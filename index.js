@@ -1,225 +1,215 @@
-const https = require("https");
-const http  = require("http");
+const { Telegraf } = require("telegraf");
+const fs = require("fs");
+const path = require("path");
 
-// ── CONFIG ──────────────────────────────────────────────
-const BOT_TOKEN    = "8769953136:AAHFrooUVd1yx8BxPbJVTJPhthyhW-ptTqY";
-const CHAT_ID      = "5092755750";
-const HELIUS_KEY   = "947b9439-fd89-44a2-a5c6-844487a27892";
-const INTERVAL_MS  = 30_000;
+// ── Config ────────────────────────────────────────────────────────────────────
+const HELIUS_API_KEY = "947b9439-fd89-44a2-a5c6-844487a27892";
+const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+const TELEGRAM_TOKEN = "8769953136:AAHFrooUVd1yx8BxPbJVTJPhthyhW-ptTqY";
+const CHAT_ID = "5092755750";
 
-const WALLETS = {
-  "5fkAwNVpT8A1UHEnY62VEFpqgagdoP8FYrv5ideiQp5c": "Logjam",
-};
+const MIN_TOKEN_AGE_DAYS = 29;
+const MIN_GAP_HOURS = 47;
+const MIN_MC = 1000;
+const MAX_MC = 10000;
+const SCAN_INTERVAL_MS = 2 * 60 * 1000;
 
-const CHAINS = ["solana"];
-// ────────────────────────────────────────────────────────
+// ── Persistent alerted set ────────────────────────────────────────────────────
+const ALERTED_FILE = path.join(__dirname, "alerted.json");
 
-const lastSeen = {};
-let lastUpdateId = 0;
-const alerted = new Map(); // cooldown tracker
-
-function get(url, headers = {}) {
-  return new Promise((resolve, reject) => {
-    const opts = new URL(url);
-    https.get({
-      hostname: opts.hostname,
-      path: opts.pathname + opts.search,
-      headers: { "User-Agent": "Mozilla/5.0", ...headers },
-    }, (res) => {
-      let data = "";
-      res.on("data", (c) => (data += c));
-      res.on("end", () => {
-        try { resolve(JSON.parse(data)); }
-        catch (e) { reject(e); }
-      });
-    }).on("error", reject);
-  });
-}
-
-function sendTelegram(text, chatId = CHAT_ID) {
-  const body = JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" });
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname: "api.telegram.org",
-      path: `/bot${BOT_TOKEN}/sendMessage`,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(body),
-      },
-    }, (res) => {
-      let d = "";
-      res.on("data", (c) => (d += c));
-      res.on("end", () => resolve(JSON.parse(d)));
-    });
-    req.on("error", reject);
-    req.write(body);
-    req.end();
-  });
-}
-
-async function pollCommands() {
+function loadAlerted() {
   try {
-    const res = await get(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=5`);
-    const updates = res?.result || [];
-    for (const update of updates) {
-      lastUpdateId = update.update_id;
-      const msg = update.message;
-      if (!msg || !msg.text) continue;
-      const chatId = msg.chat.id.toString();
-      const text = msg.text.trim();
-      const cmd = text.split(/\s+/)[0].toLowerCase();
-
-      if (cmd === "/help") {
-        await sendTelegram(
-          `🤖 <b>Logjam Wallet Tracker</b>\n\n` +
-          `Monitoring: <b>Logjam</b>\n` +
-          `Wallet: <code>5fkAwNVpT8A1UHEnY62VEFpqgagdoP8FYrv5ideiQp5c</code>\n\n` +
-          `Alerts fire on any buy or receive across Solana, Ethereum and BSC.\n` +
-          `No MC filter — everything gets alerted.`,
-          chatId
-        );
-      }
+    if (fs.existsSync(ALERTED_FILE)) {
+      const data = JSON.parse(fs.readFileSync(ALERTED_FILE, "utf8"));
+      return new Set(data);
     }
   } catch (e) {
-    console.error("[CMD ERROR]", e.message);
+    console.error("[loadAlerted] starting fresh:", e.message);
+  }
+  return new Set();
+}
+
+function saveAlerted(set) {
+  try {
+    fs.writeFileSync(ALERTED_FILE, JSON.stringify([...set]), "utf8");
+  } catch (e) {
+    console.error("[saveAlerted]", e.message);
   }
 }
 
-async function getTokenData(mint) {
+const alerted = loadAlerted();
+
+// ── Telegram ──────────────────────────────────────────────────────────────────
+const bot = new Telegraf(TELEGRAM_TOKEN);
+
+function sendAlert(token) {
+  const dexUrl = `https://dexscreener.com/solana/${token.address}`;
+  const msg =
+    `🚨 *DORMANT TOKEN WOKE UP*\n\n` +
+    `*${token.symbol || "UNKNOWN"}*\n` +
+    `📅 Age: ${token.ageDays} days old\n` +
+    `💤 Was dormant: ${token.gapHours}h\n` +
+    `💰 MC: $${Math.round(token.mc).toLocaleString()}\n` +
+    `🔗 [View on DexScreener](${dexUrl})`;
+
+  bot.telegram
+    .sendMessage(CHAT_ID, msg, { parse_mode: "Markdown" })
+    .catch(console.error);
+
+  console.log(
+    `[ALERT] ${token.symbol} | MC $${Math.round(token.mc)} | Gap ${token.gapHours}h | Age ${token.ageDays}d`
+  );
+}
+
+// ── DexScreener: fetch low MC solana pairs ────────────────────────────────────
+async function fetchCandidates() {
+  const results = new Map();
+
+  const endpoints = [
+    "https://api.dexscreener.com/latest/dex/pairs/solana",
+    "https://api.dexscreener.com/token-boosts/latest/v1",
+  ];
+
+  for (const url of endpoints) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const json = await res.json();
+
+      const pairs = json?.pairs || json?.data?.pairs || [];
+      const tokens = json?.tokens || [];
+
+      for (const p of pairs) {
+        if (p.chainId !== "solana") continue;
+        const mc = p.marketCap || p.fdv || 0;
+        if (mc < MIN_MC || mc > MAX_MC) continue;
+        const address = p.baseToken?.address;
+        if (!address || results.has(address)) continue;
+        results.set(address, {
+          address,
+          symbol: p.baseToken?.symbol || "?",
+          mc,
+          pairCreatedAt: p.pairCreatedAt || null,
+        });
+      }
+
+      for (const t of tokens) {
+        if (t.chainId !== "solana") continue;
+        const address = t.tokenAddress;
+        if (!address || results.has(address)) continue;
+        results.set(address, {
+          address,
+          symbol: t.description || "?",
+          mc: 0,
+          pairCreatedAt: null,
+        });
+      }
+    } catch (e) {
+      console.error(`[fetchCandidates] ${url}:`, e.message);
+    }
+  }
+
+  return [...results.values()];
+}
+
+// ── DexScreener: get pair detail for a specific token ─────────────────────────
+async function getPairDetail(address) {
   try {
-    const res = await get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-    const pairs = res?.pairs;
-    if (!Array.isArray(pairs) || pairs.length === 0) return null;
-    const valid = pairs.filter(p => CHAINS.includes((p.chainId || "").toLowerCase()));
-    if (valid.length === 0) return null;
-    valid.sort((a, b) => parseFloat(b.liquidity?.usd || 0) - parseFloat(a.liquidity?.usd || 0));
-    return valid[0];
+    const res = await fetch(
+      `https://api.dexscreener.com/latest/dex/tokens/${address}`
+    );
+    if (!res.ok) return null;
+    const json = await res.json();
+    const pairs = json?.pairs || [];
+    const solanaPairs = pairs.filter((p) => p.chainId === "solana");
+    if (!solanaPairs.length) return null;
+    solanaPairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+    return solanaPairs[0];
   } catch (e) {
     return null;
   }
 }
 
-async function initLastSeen() {
+// ── Helius: get last transaction timestamp ────────────────────────────────────
+async function getLastTradeSec(mintAddress) {
   try {
-    const txs = await get(
-      `https://api.helius.xyz/v0/addresses/5fkAwNVpT8A1UHEnY62VEFpqgagdoP8FYrv5ideiQp5c/transactions?api-key=${HELIUS_KEY}&limit=1`
-    );
-    if (Array.isArray(txs) && txs.length > 0) {
-      lastSeen["5fkAwNVpT8A1UHEnY62VEFpqgagdoP8FYrv5ideiQp5c"] = txs[0].signature;
-      console.log(`[INIT] Last seen tx set — only new transactions will alert`);
-    }
+    const res = await fetch(HELIUS_RPC, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "getSignaturesForAddress",
+        params: [mintAddress, { limit: 5, commitment: "confirmed" }],
+      }),
+    });
+    const json = await res.json();
+    const sigs = json?.result;
+    if (!sigs || !sigs.length) return null;
+    return sigs[0]?.blockTime || null;
   } catch (e) {
-    console.error("[INIT ERROR]", e.message);
+    return null;
   }
 }
 
-async function checkWallet(walletAddr, walletName) {
-  try {
-    const txs = await get(
-      `https://api.helius.xyz/v0/addresses/${walletAddr}/transactions?api-key=${HELIUS_KEY}&limit=10`
-    );
-    if (!Array.isArray(txs) || txs.length === 0) return;
+// ── Main scan ─────────────────────────────────────────────────────────────────
+async function scan() {
+  console.log(`\n[SCAN] ${new Date().toISOString()}`);
 
-    const latestSig = txs[0]?.signature;
-    if (lastSeen[walletAddr] === latestSig) return;
-    lastSeen[walletAddr] = latestSig;
+  const candidates = await fetchCandidates();
+  console.log(`[SCAN] ${candidates.length} candidates in MC range`);
 
-    for (const tx of txs) {
-      const transfers = tx?.tokenTransfers || [];
-      const type = tx?.type || "";
+  const nowSec = Math.floor(Date.now() / 1000);
 
-      for (const transfer of transfers) {
-        const mint = transfer?.mint;
-        if (!mint) continue;
+  for (const token of candidates) {
+    const { address } = token;
+    if (alerted.has(address)) continue;
 
-        // Skip SOL, USDC, USDT
-        if (mint === "So11111111111111111111111111111111111111112") continue;
-        if (mint === "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v") continue;
-        if (mint === "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB") continue;
+    // Age check
+    let ageDays = null;
+    if (token.pairCreatedAt) {
+      ageDays = Math.floor((Date.now() - token.pairCreatedAt) / 86_400_000);
+      if (ageDays < MIN_TOKEN_AGE_DAYS) continue;
+    }
 
-        const isReceived = transfer?.toUserAccount === walletAddr;
-        const isBuy = type === "SWAP" && transfer?.toUserAccount === walletAddr;
-        if (!isReceived && !isBuy) continue;
-
-        // 1 hour cooldown per token
-        const lastAlert = alerted.get(mint) || 0;
-        if (Date.now() - lastAlert < 3600_000) continue;
-        alerted.set(mint, Date.now());
-
-        const pair = await getTokenData(mint);
-        if (!pair) continue;
-
-        const chain      = pair.chainId || "unknown";
-        const name       = pair.baseToken?.name || "Unknown";
-        const symbol     = pair.baseToken?.symbol || "?";
-        const priceUsd   = parseFloat(pair.priceUsd || 0);
-        const mcapRaw    = parseFloat(pair.marketCap || 0);
-        const mcap       = mcapRaw ? `$${Number(mcapRaw).toLocaleString()}` : "N/A";
-        const liq        = `$${Number(pair.liquidity?.usd || 0).toLocaleString()}`;
-        const change1h   = pair.priceChange?.h1 != null ? `${pair.priceChange.h1 > 0 ? "+" : ""}${parseFloat(pair.priceChange.h1).toFixed(1)}%` : "N/A";
-        const change24h  = pair.priceChange?.h24 != null ? `${pair.priceChange.h24 > 0 ? "+" : ""}${parseFloat(pair.priceChange.h24).toFixed(1)}%` : "N/A";
-        const action     = isReceived && type !== "SWAP" ? "🎁 Airdropped" : "💸 Bought";
-        const chainLabel = chain === "bsc" ? "BSC" : chain.charAt(0).toUpperCase() + chain.slice(1);
-        const dexUrl     = `https://dexscreener.com/${chain}/${pair.pairAddress}`;
-        const fomoUrl    = `https://fomo.family/tokens/${chain}/${mint}`;
-
-        const msg =
-`👀 <b>LOGJAM ALERT</b>
-
-👤 <b>Logjam</b> — ${action}
-🔗 Chain: <b>${chainLabel}</b>
-🪙 <b>${name}</b> (<b>$${symbol}</b>)
-💰 Market Cap: <b>${mcap}</b>
-💵 Price: <b>$${priceUsd.toFixed(8)}</b>
-💧 Liquidity: <b>${liq}</b>
-📈 1h Change: <b>${change1h}</b>
-📈 24h Change: <b>${change24h}</b>
-
-📋 CA: <code>${mint}</code>
-
-🔗 <a href="${dexUrl}">DexScreener</a> | <a href="${fomoUrl}">FOMO</a>
-
-⚠️ DYOR — not financial advice.`;
-
-        await sendTelegram(msg);
-        console.log(`[ALERT] Logjam ${action} ${symbol} | MC: ${mcap} | Chain: ${chainLabel}`);
-        await new Promise(r => setTimeout(r, 500));
+    // MC check — re-fetch if unknown
+    let mc = token.mc;
+    if (!mc || mc < MIN_MC || mc > MAX_MC) {
+      const detail = await getPairDetail(address);
+      if (!detail) continue;
+      mc = detail.marketCap || detail.fdv || 0;
+      if (mc < MIN_MC || mc > MAX_MC) continue;
+      if (!ageDays && detail.pairCreatedAt) {
+        ageDays = Math.floor((Date.now() - detail.pairCreatedAt) / 86_400_000);
+        if (ageDays < MIN_TOKEN_AGE_DAYS) continue;
       }
     }
-  } catch (e) {
-    console.error(`[ERROR] Logjam:`, e.message);
+
+    if (!ageDays || ageDays < MIN_TOKEN_AGE_DAYS) continue;
+
+    // Dormancy check via Helius
+    const lastTrade = await getLastTradeSec(address);
+    if (!lastTrade) continue;
+
+    const gapHours = Math.floor((nowSec - lastTrade) / 3600);
+    if (gapHours < MIN_GAP_HOURS) continue;
+
+    // Passed all filters → alert and persist
+    alerted.add(address);
+    saveAlerted(alerted);
+    sendAlert({ address, symbol: token.symbol, ageDays, gapHours, mc });
+
+    await new Promise((r) => setTimeout(r, 500));
   }
 }
 
-async function scan() {
-  console.log(`[${new Date().toLocaleTimeString()}] Scanning Logjam...`);
-  await checkWallet("5fkAwNVpT8A1UHEnY62VEFpqgagdoP8FYrv5ideiQp5c", "Logjam");
-  console.log(`[${new Date().toLocaleTimeString()}] Scan complete`);
-}
+// ── Boot ──────────────────────────────────────────────────────────────────────
+console.log("🤖 SOL Dormant Token Scanner");
+console.log(`   MC range : $${MIN_MC.toLocaleString()} – $${MAX_MC.toLocaleString()}`);
+console.log(`   Min age  : ${MIN_TOKEN_AGE_DAYS} days`);
+console.log(`   Min gap  : ${MIN_GAP_HOURS}h dormant`);
+console.log(`   Interval : ${SCAN_INTERVAL_MS / 1000}s`);
+console.log(`   Alerted  : ${alerted.size} tokens already seen\n`);
 
-// Keep-alive
-http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end("logjam tracker alive");
-}).listen(process.env.PORT || 3000, () => console.log(`Ping server on port ${process.env.PORT || 3000}`));
-
-(async () => {
-  console.log("👀 Logjam Wallet Tracker started");
-  console.log(`   Wallet   : 5fkAwNVpT8A1UHEnY62VEFpqgagdoP8FYrv5ideiQp5c`);
-  console.log(`   Chains   : Solana, Ethereum, BSC`);
-  console.log(`   MC filter: None`);
-  console.log(`   Interval : ${INTERVAL_MS / 1000}s\n`);
-  await sendTelegram(
-    `✅ <b>Logjam Wallet Tracker is live!</b>\n\n` +
-    `👤 Monitoring: <b>Logjam</b>\n` +
-    `🔗 Chains: Solana only\n` +
-    `💰 MC filter: None — all tokens alerted\n` +
-    `⏱ Scan: every 30 seconds\n\n` +
-    `The moment Logjam touches anything, you'll know. 👀`
-  );
-  await initLastSeen();
-  await scan();
-  setInterval(scan, INTERVAL_MS);
-  setInterval(pollCommands, 3000);
-})();
+scan();
+setInterval(scan, SCAN_INTERVAL_MS);
