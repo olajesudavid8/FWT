@@ -213,3 +213,15 @@ console.log(`   Alerted  : ${alerted.size} tokens already seen\n`);
 
 scan();
 setInterval(scan, SCAN_INTERVAL_MS);
+
+// Send boot message to Telegram
+bot.telegram.sendMessage(
+  CHAT_ID,
+  `✅ *Scanner Online*\n\n` +
+  `MC range: $${MIN_MC.toLocaleString()} – $${MAX_MC.toLocaleString()}\n` +
+  `Min age: ${MIN_TOKEN_AGE_DAYS} days\n` +
+  `Min gap: ${MIN_GAP_HOURS}h dormant\n` +
+  `Scan every: ${SCAN_INTERVAL_MS / 1000}s\n` +
+  `Previously seen: ${alerted.size} tokens`,
+  { parse_mode: "Markdown" }
+).catch(console.error);
