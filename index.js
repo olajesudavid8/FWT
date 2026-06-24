@@ -6,19 +6,20 @@ const http = require("http");
 // ── Config ────────────────────────────────────────────────────────────────────
 const HELIUS_API_KEY = "947b9439-fd89-44a2-a5c6-844487a27892";
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+const HELIUS_API = `https://api.helius.xyz/v0`;
 const TELEGRAM_TOKEN = "8769953136:AAHFrooUVd1yx8BxPbJVTJPhthyhW-ptTqY";
 const CHAT_ID = "5092755750";
 const PORT = process.env.PORT || 3000;
 
 const MIN_TOKEN_AGE_DAYS = 29;
-const MIN_GAP_HOURS = 47;
+const MIN_GAP_HOURS = 24;
 const MIN_MC = 1000;
 const MAX_MC = 10000;
-const SCAN_INTERVAL_MS = 2 * 60 * 1000;
+const SCAN_INTERVAL_MS = 45 * 1000; // every 30 seconds
 
-// ── Keep-alive HTTP server (required by Railway) ──────────────────────────────
+// ── HTTP server — keeps Railway alive ─────────────────────────────────────────
 http.createServer((req, res) => res.end("OK")).listen(PORT, () => {
-  log("BOOT", `Health check server listening on port ${PORT}`);
+  log("BOOT", `Health check server on port ${PORT}`);
 });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -29,49 +30,49 @@ function logError(tag, msg, err) {
   console.error(`[${new Date().toISOString()}] [${tag}] ${msg}`, err?.message || err || "");
 }
 
-// ── Persistent alerted set ────────────────────────────────────────────────────
-const ALERTED_FILE = path.join(__dirname, "alerted.json");
+// ── Persistent state ──────────────────────────────────────────────────────────
+// lastSeen: token address → last trade unix timestamp (seconds)
+// alerted: set of addresses already alerted this session
+const STATE_FILE = path.join(__dirname, "state.json");
 
-function loadAlerted() {
+function loadState() {
   try {
-    if (fs.existsSync(ALERTED_FILE)) {
-      const data = JSON.parse(fs.readFileSync(ALERTED_FILE, "utf8"));
-      log("BOOT", `Loaded ${data.length} previously alerted tokens from disk`);
-      return new Set(data);
-    } else {
-      log("BOOT", "No alerted.json found — starting fresh");
+    if (fs.existsSync(STATE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+      log("BOOT", `Loaded state: ${Object.keys(data.lastSeen || {}).length} tokens tracked, ${(data.alerted || []).length} alerted`);
+      return {
+        lastSeen: data.lastSeen || {},
+        alerted: new Set(data.alerted || []),
+      };
     }
   } catch (e) {
-    logError("BOOT", "Failed to load alerted.json, starting fresh:", e);
+    logError("BOOT", "Failed to load state:", e);
   }
-  return new Set();
+  log("BOOT", "No state file — starting fresh");
+  return { lastSeen: {}, alerted: new Set() };
 }
 
-function saveAlerted(set) {
+function saveState(state) {
   try {
-    fs.writeFileSync(ALERTED_FILE, JSON.stringify([...set]), "utf8");
+    fs.writeFileSync(STATE_FILE, JSON.stringify({
+      lastSeen: state.lastSeen,
+      alerted: [...state.alerted],
+    }), "utf8");
   } catch (e) {
-    logError("SAVE", "Failed to save alerted.json:", e);
+    logError("SAVE", "Failed to save state:", e);
   }
 }
 
-const alerted = loadAlerted();
+const state = loadState();
 
 // ── Telegram ──────────────────────────────────────────────────────────────────
-let bot;
-try {
-  bot = new Telegraf(TELEGRAM_TOKEN);
-  log("BOOT", "Telegraf bot initialised");
-} catch (e) {
-  logError("BOOT", "Failed to initialise Telegraf:", e);
-  process.exit(1);
-}
+const bot = new Telegraf(TELEGRAM_TOKEN);
 
 async function sendTelegram(msg) {
   try {
     await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: "Markdown" });
   } catch (e) {
-    logError("TELEGRAM", "Failed to send message:", e);
+    logError("TELEGRAM", "Failed to send:", e);
   }
 }
 
@@ -84,157 +85,209 @@ function sendAlert(token) {
     `💤 Was dormant: ${token.gapHours}h\n` +
     `💰 MC: $${Math.round(token.mc).toLocaleString()}\n` +
     `🔗 [View on DexScreener](${dexUrl})`;
-
   sendTelegram(msg);
   log("ALERT", `${token.symbol} | MC $${Math.round(token.mc)} | Gap ${token.gapHours}h | Age ${token.ageDays}d`);
 }
 
-// ── Raydium: fetch pools page by page, filter by low MC ──────────────────────
-async function fetchCandidates() {
-  const results = new Map();
-  let page = 1;
-  const pageSize = 100;
-  let totalFetched = 0;
-
-  // Raydium sorts by liquidity asc — so low liquidity (our targets) come first
-  // We stop once MC starts going above our range consistently
-  while (true) {
-    try {
-      const url = `https://api-v3.raydium.io/pools/info/list?poolType=all&poolSortField=liquidity&sortType=asc&pageSize=${pageSize}&page=${page}`;
-      log("FETCH", `Raydium page ${page} → ${url}`);
-
-      const res = await fetch(url);
-      if (!res.ok) {
-        logError("FETCH", `Raydium bad response: ${res.status}`);
-        break;
+// ── Helius: get recent swap transactions ──────────────────────────────────────
+// Uses the enhanced transactions API to pull latest swaps on Solana
+async function getRecentSwaps() {
+  try {
+    // Pull last 100 parsed transactions of type SWAP across all programs
+    const res = await fetch(
+      `${HELIUS_API}/transactions?api-key=${HELIUS_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query: {
+            types: ["SWAP"],
+          },
+          options: {
+            limit: 100, // max allowed by Helius
+          },
+        }),
       }
-
-      const json = await res.json();
-      const pools = json?.data?.data || [];
-      if (!pools.length) {
-        log("FETCH", `Raydium page ${page} empty — stopping`);
-        break;
-      }
-
-      totalFetched += pools.length;
-      let inRangeCount = 0;
-
-      for (const pool of pools) {
-        const mc = pool.marketCap || pool.tvl || 0;
-        if (mc > MAX_MC * 5) {
-          // We've gone well past our range, stop paginating
-          log("FETCH", `MC ceiling reached at page ${page}, stopping`);
-          return [...results.values()];
-        }
-        if (mc < MIN_MC || mc > MAX_MC) continue;
-
-        const address = pool.mintA?.address;
-        const symbol = pool.mintA?.symbol;
-        const pairCreatedAt = pool.openTime ? pool.openTime * 1000 : null; // openTime is unix sec
-
-        if (!address || results.has(address)) continue;
-        inRangeCount++;
-        results.set(address, { address, symbol, mc, pairCreatedAt });
-      }
-
-      log("FETCH", `Page ${page}: ${pools.length} pools, ${inRangeCount} in MC range`);
-
-      // Stop after 10 pages to avoid rate limits
-      if (page >= 10) break;
-      page++;
-
-      await new Promise((r) => setTimeout(r, 300)); // be gentle with Raydium
-    } catch (e) {
-      logError("FETCH", `Exception on page ${page}:`, e);
-      break;
+    );
+    if (!res.ok) {
+      logError("HELIUS", `getRecentSwaps bad response: ${res.status} ${res.statusText}`);
+      return [];
     }
+    const json = await res.json();
+    return Array.isArray(json) ? json : [];
+  } catch (e) {
+    logError("HELIUS", "getRecentSwaps exception:", e);
+    return [];
   }
-
-  log("FETCH", `Total fetched: ${totalFetched} pools, ${results.size} in MC range`);
-  return [...results.values()];
 }
 
-// ── Helius: get last transaction timestamp ────────────────────────────────────
+// ── Helius: get last trade time for a specific token ──────────────────────────
 async function getLastTradeSec(mintAddress) {
   try {
     const res = await fetch(HELIUS_RPC, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
+        jsonrpc: "2.0", id: 1,
         method: "getSignaturesForAddress",
         params: [mintAddress, { limit: 5, commitment: "confirmed" }],
       }),
     });
-    if (!res.ok) {
-      logError("HELIUS", `Bad response for ${mintAddress}: ${res.status}`);
-      return null;
-    }
+    if (!res.ok) return null;
     const json = await res.json();
-    if (json?.error) {
-      logError("HELIUS", `RPC error for ${mintAddress}: ${json.error.message}`);
-      return null;
-    }
+    if (json?.error) return null;
     const sigs = json?.result;
-    if (!sigs || !sigs.length) return null;
+    if (!sigs?.length) return null;
     return sigs[0]?.blockTime || null;
   } catch (e) {
-    logError("HELIUS", `Exception for ${mintAddress}:`, e);
     return null;
   }
 }
 
+// ── Helius: get token mint creation time ──────────────────────────────────────
+async function getTokenAgeDays(mintAddress) {
+  try {
+    const res = await fetch(HELIUS_RPC, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 1,
+        method: "getSignaturesForAddress",
+        params: [mintAddress, { limit: 1000, commitment: "confirmed" }],
+      }),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const sigs = json?.result;
+    if (!sigs?.length) return null;
+    const oldest = sigs[sigs.length - 1];
+    if (!oldest?.blockTime) return null;
+    return Math.floor((Date.now() / 1000 - oldest.blockTime) / 86400);
+  } catch (e) {
+    return null;
+  }
+}
+
+// ── DexScreener: get MC for a token ──────────────────────────────────────────
+async function getTokenMC(address) {
+  try {
+    const res = await fetch(`https://api.dexscreener.com/token-pairs/v1/solana/${address}`);
+    if (!res.ok) return null;
+    const json = await res.json();
+    const pairs = Array.isArray(json) ? json : (json?.pairs || []);
+    if (!pairs.length) return null;
+    pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+    const mc = pairs[0]?.marketCap || pairs[0]?.fdv || 0;
+    const pairCreatedAt = pairs[0]?.pairCreatedAt || null;
+    const symbol = pairs[0]?.baseToken?.symbol || null;
+    return { mc, pairCreatedAt, symbol };
+  } catch (e) {
+    return null;
+  }
+}
+
+// ── Extract token mints from a swap transaction ───────────────────────────────
+function extractTokensFromSwap(tx) {
+  const mints = new Set();
+  // Helius enhanced txs have tokenTransfers array
+  for (const transfer of tx.tokenTransfers || []) {
+    if (transfer.mint) mints.add(transfer.mint);
+  }
+  return [...mints];
+}
+
 // ── Main scan ─────────────────────────────────────────────────────────────────
 async function scan() {
-  log("SCAN", "Starting scan...");
+  log("SCAN", "Fetching recent swaps from Helius...");
 
-  let candidates;
-  try {
-    candidates = await fetchCandidates();
-  } catch (e) {
-    logError("SCAN", "fetchCandidates threw:", e);
-    await sendTelegram(`⚠️ *Scan error*: fetchCandidates failed — ${e.message}`);
-    return;
-  }
+  const swaps = await getRecentSwaps();
+  log("SCAN", `Got ${swaps.length} recent swap transactions`);
 
-  log("SCAN", `${candidates.length} candidates to evaluate`);
+  if (!swaps.length) return;
 
   const nowSec = Math.floor(Date.now() / 1000);
-  let skippedAlerted = 0, skippedAge = 0, skippedDormancy = 0, passed = 0;
 
-  for (const token of candidates) {
-    const { address } = token;
-    if (alerted.has(address)) { skippedAlerted++; continue; }
+  // Collect unique token mints from all swaps
+  const seenThisScan = new Map(); // mint → blockTime
 
-    // Age check
-    if (!token.pairCreatedAt) { skippedAge++; continue; }
-    const ageDays = Math.floor((Date.now() - token.pairCreatedAt) / 86_400_000);
-    if (ageDays < MIN_TOKEN_AGE_DAYS) { skippedAge++; continue; }
+  for (const tx of swaps) {
+    const blockTime = tx.timestamp || tx.blockTime;
+    if (!blockTime) continue;
+    const mints = extractTokensFromSwap(tx);
+    for (const mint of mints) {
+      if (!seenThisScan.has(mint)) {
+        seenThisScan.set(mint, blockTime);
+      }
+    }
+  }
 
-    // Dormancy check via Helius
-    const lastTrade = await getLastTradeSec(address);
-    if (!lastTrade) { skippedDormancy++; continue; }
+  log("SCAN", `${seenThisScan.size} unique tokens active in recent swaps`);
 
-    const gapHours = Math.floor((nowSec - lastTrade) / 3600);
-    if (gapHours < MIN_GAP_HOURS) { skippedDormancy++; continue; }
+  let checked = 0, skippedAlerted = 0, skippedGap = 0, skippedAge = 0, skippedMC = 0, passed = 0;
+
+  for (const [mint, currentTxTime] of seenThisScan) {
+    // Skip already alerted
+    if (state.alerted.has(mint)) { skippedAlerted++; continue; }
+
+    const prevLastSeen = state.lastSeen[mint];
+
+    // Update lastSeen
+    state.lastSeen[mint] = currentTxTime;
+
+    // If we've never seen this token before, just record it and move on
+    if (!prevLastSeen) continue;
+
+    // Check gap: was previous trade 48h+ ago?
+    const gapSeconds = currentTxTime - prevLastSeen;
+    const gapHours = Math.floor(gapSeconds / 3600);
+
+    if (gapHours < MIN_GAP_HOURS) { skippedGap++; continue; }
+
+    checked++;
+    log("SCAN", `Gap hit: ${mint} | gap ${gapHours}h — checking age + MC`);
+
+    // Check MC via DexScreener
+    const dexData = await getTokenMC(mint);
+    if (!dexData) { skippedMC++; continue; }
+
+    const { mc, pairCreatedAt, symbol } = dexData;
+    if (mc < MIN_MC || mc > MAX_MC) { 
+      log("SCAN", `MC out of range: ${symbol} $${Math.round(mc)}`);
+      skippedMC++; 
+      continue; 
+    }
+
+    // Check age
+    let ageDays = null;
+    if (pairCreatedAt) {
+      ageDays = Math.floor((Date.now() - pairCreatedAt) / 86_400_000);
+    } else {
+      ageDays = await getTokenAgeDays(mint);
+    }
+
+    if (!ageDays || ageDays < MIN_TOKEN_AGE_DAYS) { 
+      log("SCAN", `Too young: ${symbol} ${ageDays}d`);
+      skippedAge++; 
+      continue; 
+    }
 
     // Passed all filters
     passed++;
-    alerted.add(address);
-    saveAlerted(alerted);
-    sendAlert({ address, symbol: token.symbol, ageDays, gapHours, mc: token.mc });
-
+    state.alerted.add(mint);
+    saveState(state);
+    sendAlert({ address: mint, symbol, ageDays, gapHours, mc });
     await new Promise((r) => setTimeout(r, 500));
   }
 
-  log("SCAN", `Done — passed: ${passed} | skipped: alerted=${skippedAlerted} age=${skippedAge} dormancy=${skippedDormancy}`);
+  // Save updated lastSeen state
+  saveState(state);
+
+  log("SCAN", `Done — checked gaps: ${checked} | passed: ${passed} | skipped: alerted=${skippedAlerted} gap=${skippedGap} age=${skippedAge} mc=${skippedMC}`);
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 log("BOOT", "SOL Dormant Token Scanner starting");
-log("BOOT", `MC range: $${MIN_MC} – $${MAX_MC}`);
-log("BOOT", `Min age: ${MIN_TOKEN_AGE_DAYS} days | Min gap: ${MIN_GAP_HOURS}h | Interval: ${SCAN_INTERVAL_MS / 1000}s`);
+log("BOOT", `MC: $${MIN_MC}–$${MAX_MC} | Age: ${MIN_TOKEN_AGE_DAYS}d | Gap: ${MIN_GAP_HOURS}h | Interval: ${SCAN_INTERVAL_MS / 1000}s`);
 
 sendTelegram(
   `✅ *Scanner Online*\n\n` +
@@ -242,14 +295,13 @@ sendTelegram(
   `Min age: ${MIN_TOKEN_AGE_DAYS} days\n` +
   `Min gap: ${MIN_GAP_HOURS}h dormant\n` +
   `Scan every: ${SCAN_INTERVAL_MS / 1000}s\n` +
-  `Previously seen: ${alerted.size} tokens`
+  `Tracking: ${Object.keys(state.lastSeen).length} tokens`
 );
 
 process.on("uncaughtException", (e) => {
   logError("CRASH", "Uncaught exception:", e);
   sendTelegram(`🔴 *Scanner crashed*: ${e.message}`).finally(() => process.exit(1));
 });
-
 process.on("unhandledRejection", (e) => {
   logError("CRASH", "Unhandled rejection:", e);
 });
