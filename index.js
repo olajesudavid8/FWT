@@ -231,11 +231,21 @@ async function scan() {
     const prevLastSeen = state.lastSeen[mint];
     state.lastSeen[mint] = currentTxTime;
 
-    // First time seeing this token — just record, don't alert
-    if (!prevLastSeen) continue;
+    // First time seeing this token — look up actual last trade via Helius
+    // so we don't have to wait to observe the gap ourselves
+    let effectivePrev = prevLastSeen;
+    if (!effectivePrev) {
+      const actualLast = await getLastTradeSec(mint);
+      if (actualLast && actualLast < currentTxTime) {
+        effectivePrev = actualLast;
+        log("SCAN", `New token ${mint.slice(0, 8)}... — fetched actual last trade`);
+      } else {
+        continue; // can't determine gap, skip
+      }
+    }
 
     // Check gap
-    const gapHours = Math.floor((currentTxTime - prevLastSeen) / 3600);
+    const gapHours = Math.floor((currentTxTime - effectivePrev) / 3600);
     if (gapHours < MIN_GAP_HOURS) { skippedGap++; continue; }
 
     log("SCAN", `Gap hit: ${mint.slice(0, 8)}... | ${gapHours}h gap — checking MC + age`);
