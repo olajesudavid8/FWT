@@ -11,8 +11,8 @@ const TELEGRAM_TOKEN = "8769953136:AAHFrooUVd1yx8BxPbJVTJPhthyhW-ptTqY";
 const CHAT_ID = "5092755750";
 const PORT = process.env.PORT || 3000;
 
-const MIN_TOKEN_AGE_DAYS = 29;
-const MIN_GAP_HOURS = 24;
+const MIN_TOKEN_AGE_DAYS = 30;
+const MIN_GAP_HOURS = 48;
 const MIN_MC = 1000;
 const MAX_MC = 10000;
 const SCAN_INTERVAL_MS = 45 * 1000;
@@ -275,7 +275,7 @@ async function scan() {
 
     // MC + age via DexScreener
     const dex = await getDexData(mint);
-    if (!dex) { skippedMC++; continue; }
+    if (!dex) { log("SCAN", `No DexScreener data for ${mint.slice(0,8)}...`); skippedMC++; continue; }
     if (dex.mc < MIN_MC || dex.mc > MAX_MC) {
       log("SCAN", `MC rejected: ${dex.symbol || mint.slice(0,8)} $${Math.round(dex.mc).toLocaleString()} (range $${MIN_MC}-$${MAX_MC})`);
       skippedMC++; continue;
