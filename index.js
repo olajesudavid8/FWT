@@ -151,6 +151,29 @@ async function getRecentMintsFromProgram(programId) {
   return mints;
 }
 
+// ── Helius: get last trade timestamp for a token ─────────────────────────────
+async function getLastTradeSec(mintAddress) {
+  try {
+    const res = await fetch(HELIUS_RPC, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 1,
+        method: "getSignaturesForAddress",
+        params: [mintAddress, { limit: 5, commitment: "confirmed" }],
+      }),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (json?.error) return null;
+    const sigs = json?.result;
+    if (!sigs?.length) return null;
+    return sigs[0]?.blockTime || null;
+  } catch (e) {
+    return null;
+  }
+}
+
 // ── DexScreener: get MC + age + symbol for a token ───────────────────────────
 async function getDexData(address) {
   try {
