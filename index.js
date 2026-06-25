@@ -275,7 +275,11 @@ async function scan() {
 
     // MC + age via DexScreener
     const dex = await getDexData(mint);
-    if (!dex || dex.mc < MIN_MC || dex.mc > MAX_MC) { skippedMC++; continue; }
+    if (!dex) { skippedMC++; continue; }
+    if (dex.mc < MIN_MC || dex.mc > MAX_MC) {
+      log("SCAN", `MC rejected: ${dex.symbol || mint.slice(0,8)} $${Math.round(dex.mc).toLocaleString()} (range $${MIN_MC}-$${MAX_MC})`);
+      skippedMC++; continue;
+    }
 
     // Age check
     let ageDays = dex.pairCreatedAt
