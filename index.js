@@ -4,7 +4,7 @@ const path = require("path");
 const http = require("http");
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const HELIUS_API_KEY = "947b9439-fd89-44a2-a5c6-844487a27892";
+const HELIUS_API_KEY = "72099335-bd1f-4fb2-b3b9-74caf6656d3f";
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const HELIUS_TX  = `https://api-mainnet.helius-rpc.com/v0`;
 const TELEGRAM_TOKEN = "8769953136:AAHFrooUVd1yx8BxPbJVTJPhthyhW-ptTqY";
@@ -12,7 +12,7 @@ const CHAT_ID = "5092755750";
 const PORT = process.env.PORT || 3000;
 
 const MIN_TOKEN_AGE_DAYS = 29;
-const MIN_GAP_HOURS = 23;
+const MIN_GAP_HOURS = 46;
 const MIN_MC = 1000;
 const MAX_MC = 10000;
 const SCAN_INTERVAL_MS = 45 * 1000;
@@ -107,7 +107,11 @@ async function getRecentMintsFromProgram(programId) {
         params: [programId, { limit: 100, commitment: "confirmed" }],
       }),
     });
-    if (!sigRes.ok) return mints;
+    if (!sigRes.ok) {
+      const text = await sigRes.text().catch(() => "");
+      await handleHeliusError(sigRes.status, text);
+      return mints;
+    }
     const sigJson = await sigRes.json();
     const sigs = sigJson?.result || [];
     if (!sigs.length) return mints;
@@ -151,6 +155,17 @@ async function getRecentMintsFromProgram(programId) {
   return mints;
 }
 
+// ── Credit exhaustion tracker ─────────────────────────────────────────────────
+let creditAlertSent = false;
+
+async function handleHeliusError(status, body) {
+  if ((status === 402 || status === 429 || (body && body.includes("credit"))) && !creditAlertSent) {
+    creditAlertSent = true;
+    logError("HELIUS", `Credits exhausted or rate limited (${status})`);
+    await sendTelegram(`🪫 *Helius credits exhausted*\n\nThe scanner has run out of API credits and is no longer fetching data.\n\nTop up at helius.dev to resume.`);
+  }
+}
+
 // ── Helius: get last trade timestamp for a token ─────────────────────────────
 async function getLastTradeSec(mintAddress) {
   try {
@@ -163,9 +178,17 @@ async function getLastTradeSec(mintAddress) {
         params: [mintAddress, { limit: 5, commitment: "confirmed" }],
       }),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      await handleHeliusError(res.status, text);
+      return null;
+    }
     const json = await res.json();
-    if (json?.error) return null;
+    if (json?.error) {
+      await handleHeliusError(200, json.error.message || "");
+      return null;
+    }
+    creditAlertSent = false; // reset on success
     const sigs = json?.result;
     if (!sigs?.length) return null;
     return sigs[0]?.blockTime || null;
