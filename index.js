@@ -15,7 +15,7 @@ const MIN_TOKEN_AGE_DAYS = 29;
 const MIN_GAP_HOURS = 46;
 const MIN_MC = 1000;
 const MAX_MC = 10000;
-const SCAN_INTERVAL_MS = 45 * 1000;
+const SCAN_INTERVAL_MS = 60 * 1000;
 
 // Raydium CPMM + AMM v4 program IDs — all recent swaps go through these
 const RAYDIUM_PROGRAMS = [
