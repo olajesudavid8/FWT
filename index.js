@@ -12,7 +12,7 @@ const CHAT_ID = "5092755750";
 const PORT = process.env.PORT || 3000;
 
 const MIN_TOKEN_AGE_DAYS = 29;
-const MIN_GAP_HOURS = 46;
+const MIN_GAP_HOURS = 24;
 const MIN_MC = 1000;
 const MAX_MC = 10000;
 const SCAN_INTERVAL_MS = 60 * 1000;
